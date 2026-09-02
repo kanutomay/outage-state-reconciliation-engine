@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Outage pipeline - representative excerpt of the production stack.
+  This is a trimmed, illustrative slice of the full template (queues, the
+  entry Lambda, and the scheduled cleanup Lambda) - not the complete IaC,
+  which also provisions the ticket-processor and DB-write Lambdas, the
+  customer-impact and node-inventory tables, the Glue export jobs/crawlers,
+  the upstream API-key/routing Lambda and the Secrets Manager secret it
+  reads (see docs/api-reference.md), and the CloudWatch alarms described in
+  docs/observability.md. Least privilege for those other components can't
+  be assessed from this excerpt alone.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: prod
+
+  CutoffTimeHours:
+    Type: Number
+    Default: 72
+    Description: SLA threshold in hours before a ticket is eligible for automated cleanup
+
+  OutageTicketTableName:
+    Type: String
+    Default: outage_ticket_db
+
+  ErrorNotificationTopicArn:
+    Type: String
+    Description: SNS topic ARN for enqueue/cleanup failure notifications
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    Description: CloudWatch Logs retention for both Lambda functions in this excerpt
+
+# Account ID and region are referenced via the AWS::AccountId/AWS::Region
+# pseudo parameters throughout rather than passed as inputs - one less
+# value to keep in sync with the deploying account/region, and neither can
+# be supplied incorrectly. An earlier version took Region as a manually
+# supplied Parameter (default us-east-1) and interpolated it into the
+# DynamoDB table ARNs below - if that parameter's value ever drifted from
+# the region the stack actually deployed into, the IAM policies would
+# reference a table ARN in the wrong region while the table itself lived in
+# the right one, silently breaking access instead of failing to deploy
+# (peer review).
+
+Resources:
+
+  # ==========================================
+  # Request queue - a single shared lifecycle
+  # FIFO queue for CREATE/UPDATE/CLOSE/CLEANUP,
+  # ordered per ticket via MessageGroupId=ticket_id
+  # (see docs/architecture-overview.md - "Why one
+  # shared lifecycle queue instead of one per
+  # intent?"). An earlier version split intents
+  # across three separate queues; FIFO only
+  # orders messages within one queue and group,
+  # so that design never actually guaranteed
+  # CREATE-before-UPDATE/CLOSE ordering despite
+  # docs claiming it did. CLEANUP is produced
+  # only by TicketCleanupFunction, onto this same
+  # queue - it's semantically a bulk CLOSE.
+  # ==========================================
+
+  PipelineDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-outage-pipeline-dlq.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14 days - give operators time to investigate/redrive
+      SqsManagedSseEnabled: true
+
+  # Deny any non-TLS access to the pipeline DLQ. The main lifecycle queue
+  # already had this, but redriven messages here can carry the same ticket
+  # data as the queue they came from, so it needs the same protection - an
+  # earlier version only applied this policy to LifecycleTicketQueue (peer
+  # review).
+  PipelineDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PipelineDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource:
+              - !GetAtt PipelineDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  LifecycleTicketQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-outage-lifecycle-ticket.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      DeduplicationScope: messageGroup   # per-ticket dedup scope, so ordering (below) can be per-group at full FIFO throughput
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 2250        # > processor Lambda timeout, avoids duplicate delivery
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PipelineDeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - {Key: environment, Value: !Ref Environment}
+        - {Key: project, Value: outage-pipeline}
+        - {Key: intent, Value: CREATE_UPDATE_CLOSE_AND_CLEANUP}
+
+  # Deny any non-TLS access to the lifecycle queue.
+  PipelineQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref LifecycleTicketQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource:
+              - !GetAtt LifecycleTicketQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ==========================================
+  # Entry Lambda - API Gateway integration target
+  # ==========================================
+  EntryValidationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/outage-entry-validation-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  EntryValidationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EntryValidationLogGroup
+    Properties:
+      FunctionName: !Sub 'outage-entry-validation-${Environment}'
+      Runtime: python3.13
+      Handler: entry_handler.lambda_handler
+      MemorySize: 256
+      Timeout: 23
+      ReservedConcurrentExecutions: 50  # caps blast radius / cost from a traffic spike or retry storm
+      Role: !GetAtt EntryValidationRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LIFECYCLE_TICKET_SQS: !GetAtt LifecycleTicketQueue.QueueName
+          OUTAGE_TICKET_TABLE: !Ref OutageTicketTableName
+          PREQUEUE_VALIDATION_MODE: enforce
+          CLOSE_IDEMPOTENT: 'true'
+          ERROR_SNS_TOPIC: !Ref ErrorNotificationTopicArn
+      Code:
+        S3Bucket: !Sub '${Environment}-outage-pipeline-deployments'
+        S3Key: !Sub 'lambdas/entry-validation/${Environment}/entry_handler.zip'
+
+  EntryValidationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'outage-entry-validation-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: entry-validation-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueUrl]
+                Resource:
+                  - !GetAtt LifecycleTicketQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:GetItem, dynamodb:PartiQLSelect]
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OutageTicketTableName}'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ErrorNotificationTopicArn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: OutageEngine/Validation
+
+  # ==========================================
+  # Scheduled cleanup - daily SLA enforcement.
+  # Publishes directly to LifecycleTicketQueue.
+  # No IAM permission or code path here accepts
+  # an HTTP/API-key request - see
+  # src/maintenance/ticket_cleanup_handler.py.
+  # ==========================================
+  TicketCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/outage-ticket-cleanup-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  TicketCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TicketCleanupLogGroup
+    Properties:
+      FunctionName: !Sub 'outage-ticket-cleanup-${Environment}'
+      Runtime: python3.11
+      Handler: ticket_cleanup_handler.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt TicketCleanupRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          CUTOFF_TIME_HOURS: !Ref CutoffTimeHours
+          OUTAGE_TICKET_TABLE: !Ref OutageTicketTableName
+          LIFECYCLE_TICKET_SQS: !GetAtt LifecycleTicketQueue.QueueName
+          EXCEPTION_SNS_ARN: !Ref ErrorNotificationTopicArn
+      Code:
+        S3Bucket: !Sub '${Environment}-outage-pipeline-deployments'
+        S3Key: !Sub 'lambdas/ticket-cleanup/${Environment}/ticket_cleanup_handler.zip'
+
+  TicketCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'outage-ticket-cleanup-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ticket-cleanup-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PartiQLSelect
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OutageTicketTableName}'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt LifecycleTicketQueue.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ErrorNotificationTopicArn
+
+  # Failure destination for the Scheduler -> Lambda invocation itself
+  # (distinct from the pipeline DLQ above, which catches processing
+  # failures downstream of the queues).
+  SchedulerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-outage-cleanup-scheduler-dlq'
+      MessageRetentionPeriod: 1209600
+
+  # Same non-TLS deny as the other two queues in this stack - there's no
+  # principled reason this queue should be held to a lower transport-security
+  # bar just because it only carries Scheduler invocation-failure payloads
+  # rather than ticket data (peer review).
+  SchedulerDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SchedulerDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource:
+              - !GetAtt SchedulerDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  TicketCleanupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub 'outage-ticket-cleanup-${Environment}'
+      Description: 'Daily stale-ticket cleanup - SLA enforcement at the configured cutoff'
+      ScheduleExpression: 'cron(0 7 * * ? *)'   # 02:00 local (UTC-5)
+      ScheduleExpressionTimezone: 'Etc/UTC'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt TicketCleanupFunction.Arn
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDeadLetterQueue.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 300
+
+  SchedulerInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-cleanup-lambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TicketCleanupFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDeadLetterQueue.Arn
+
+Outputs:
+  LifecycleTicketQueueUrl:
+    Value: !Ref LifecycleTicketQueue
+  PipelineDeadLetterQueueUrl:
+    Value: !Ref PipelineDeadLetterQueue
+  EntryValidationFunctionArn:
+    Value: !GetAtt EntryValidationFunction.Arn
+  TicketCleanupFunctionArn:
+    Value: !GetAtt TicketCleanupFunction.Arn

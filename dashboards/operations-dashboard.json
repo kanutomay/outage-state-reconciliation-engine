@@ -1,0 +1,74 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Invocations", {"stat": "Sum", "label": "Total Requests"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "Request Volume (All Intents)",
+        "period": 300,
+        "yAxis": {"left": {"label": "Count"}}
+      }
+    },
+    {
+      "type": "log",
+      "properties": {
+        "query": "SOURCE '/aws/lambda/outage-entry-validation-prod'\n| fields @timestamp, intent, sent_to_sqs_flag\n| stats count() as total, sum(sent_to_sqs_flag) as successful by bin(5m), intent\n",
+        "region": "us-east-1",
+        "stacked": false,
+        "title": "Request Volume by Intent",
+        "view": "timeSeries"
+      }
+    },
+    {
+      "type": "log",
+      "properties": {
+        "query": "SOURCE '/aws/lambda/outage-entry-validation-prod'\n| fields @timestamp, sent_to_sqs_flag\n| stats count() as total, sum(sent_to_sqs_flag) as successful, (sum(sent_to_sqs_flag) * 100.0 / count()) as success_rate",
+        "region": "us-east-1",
+        "title": "Validation Success Rate",
+        "view": "singleValue"
+      }
+    },
+    {
+      "type": "log",
+      "properties": {
+        "query": "SOURCE '/aws/lambda/outage-entry-validation-prod'\n| fields @timestamp, ticket_id, intent, processing_status, error_type\n| filter sent_to_sqs_flag = 0\n| sort @timestamp desc\n| limit 20",
+        "region": "us-east-1",
+        "title": "Recent Validation Failures",
+        "view": "table"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible", {"stat": "Average"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "SQS Queue Depth",
+        "period": 60,
+        "yAxis": {"left": {"label": "Messages"}}
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Lambda", "Errors", {"stat": "Sum"}],
+          ["AWS/Lambda", "Duration", {"stat": "p95", "yAxis": "right"}]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "Lambda Errors & P95 Latency",
+        "period": 300
+      }
+    }
+  ]
+}
